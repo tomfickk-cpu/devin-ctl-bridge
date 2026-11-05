@@ -1,1 +1,1 @@
-{"rev":1,"cmds":[{"id":"c1","type":"js","expr":"location.href+' | '+document.title"}]}
+{"rev":2,"cmds":[{"id":"c2","type":"js","expr":"location.href+' | '+document.title"},{"id":"c3","type":"shot"}]}
