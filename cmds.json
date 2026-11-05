@@ -1,1 +1,1 @@
-{"rev":0,"cmds":[]}
+{"rev":1,"cmds":[{"id":"c1","type":"js","expr":"location.href+' | '+document.title"}]}
