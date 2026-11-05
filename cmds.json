@@ -1,1 +1,1 @@
-{"rev":2,"cmds":[{"id":"c2","type":"js","expr":"location.href+' | '+document.title"},{"id":"c3","type":"shot"}]}
+{"rev":3,"cmds":[{"id":"g1","type":"goto","url":"https://adsmanager.facebook.com/adsmanager/manage/campaigns?act=1423208039660541"}]}
